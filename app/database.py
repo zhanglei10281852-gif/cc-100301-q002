@@ -235,6 +235,10 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     current_observation_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    cancel_requested_by TEXT NOT NULL DEFAULT '',
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT NOT NULL DEFAULT '',
+    cancel_outcome TEXT NOT NULL DEFAULT '' CHECK(cancel_outcome IN ('','immediate','confirmed','expired')),
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -267,6 +271,21 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
 '''
+
+# 旧版本数据库缺少的 pilot_sessions 列，按名幂等补齐（SQLite 的 CREATE TABLE IF NOT EXISTS 不会更新已有表）。
+PILOT_SESSION_MIGRATIONS = {
+    "cancel_requested_by": "cancel_requested_by TEXT NOT NULL DEFAULT ''",
+    "cancel_reason": "cancel_reason TEXT NOT NULL DEFAULT ''",
+    "cancel_requested_at": "cancel_requested_at TEXT NOT NULL DEFAULT ''",
+    "cancel_outcome": "cancel_outcome TEXT NOT NULL DEFAULT '' CHECK(cancel_outcome IN ('','immediate','confirmed','expired'))",
+}
+
+
+def _ensure_pilot_session_columns(connection: sqlite3.Connection) -> None:
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(pilot_sessions)")}
+    for name, definition in PILOT_SESSION_MIGRATIONS.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE pilot_sessions ADD COLUMN {definition}")
 
 
 PERMISSIONS = [
@@ -334,7 +353,8 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _ensure_pilot_session_columns(connection)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

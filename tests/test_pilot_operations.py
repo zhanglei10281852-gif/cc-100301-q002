@@ -2,9 +2,12 @@
 
 from datetime import UTC, datetime
 
+import pytest
+
 from app.pilots.service import PilotOperationsService
 from app.core.clock import FrozenClock
-from app.database import get_connection, transaction
+from app.core.errors import ConflictError
+from app.database import get_connection, init_db, transaction
 
 
 PROTOCOL = {
@@ -97,8 +100,6 @@ def test_quota_cancel_retry_priority_and_batch_interventions(client):
 
 
 def test_failure_backoff_and_expired_lease_recovery(client):
-    from app.database import init_db
-
     init_db()
     clock = FrozenClock(datetime(2026, 9, 26, 2, 0, tzinfo=UTC))
     service = PilotOperationsService(get_connection(), clock)
@@ -118,4 +119,154 @@ def test_failure_backoff_and_expired_lease_recovery(client):
     details = service.get_session(first["id"])
     assert details["status"] == "failed"
     assert details["interventions"][-1]["action"] == "lease_recovery"
+
+
+def make_clocked_service(hour: int = 8) -> tuple[PilotOperationsService, FrozenClock]:
+    init_db()
+    clock = FrozenClock(datetime(2026, 10, 6, hour, 0, tzinfo=UTC))
+    service = PilotOperationsService(get_connection(), clock)
+    service.create_protocol(PROTOCOL, "administrator")
+    return service, clock
+
+
+def test_cancel_commitment_confirmed_by_site(client):
+    service, clock = make_clocked_service()
+    submitted = service.submit(submit_payload("cancel-confirm-001"))
+    claimed = service.claim("site-storm", ["chapter-transfer"], 120)
+    assert claimed and claimed["id"] == submitted["id"]
+
+    requested = service.cancel(submitted["id"], "support-agent-7", "暴雨红色预警，亲子团要求终止行程")
+    assert requested["status"] == "cancel_requested"
+    assert requested["cancel_requested_by"] == "support-agent-7"
+    assert requested["cancel_reason"] == "暴雨红色预警，亲子团要求终止行程"
+    assert requested["cancel_requested_at"]
+    assert requested["lease_owner"] == "site-storm"
+    assert requested["finished_at"] is None
+
+    # 承诺生效后：不得续租、不得提交普通履约回执、不会被重新领取。
+    with pytest.raises(ConflictError):
+        service.heartbeat(submitted["id"], "site-storm", 120)
+    with pytest.raises(ConflictError):
+        service.complete(submitted["id"], "site-storm", {"value": 1}, {})
+    with pytest.raises(ConflictError):
+        service.fail(submitted["id"], "site-storm", "connection_delayed", "前序列车晚点", True)
+    assert service.claim("site-other", ["chapter-transfer"], 60) is None
+
+    # 重复申请不改写已经登记的承诺。
+    again = service.cancel(submitted["id"], "another-agent", "重复登记的其他原因")
+    assert again["status"] == "cancel_requested"
+    assert again["cancel_requested_by"] == "support-agent-7"
+    assert again["cancel_reason"] == "暴雨红色预警，亲子团要求终止行程"
+
+    # 其他节点不能代为确认。
+    with pytest.raises(ConflictError):
+        service.confirm_cancel(submitted["id"], "site-other")
+
+    clock.advance(seconds=30)
+    confirmed = service.confirm_cancel(submitted["id"], "site-storm", "车辆已安全返回接待点")
+    assert confirmed["status"] == "cancelled"
+    assert confirmed["cancel_outcome"] == "confirmed"
+    assert confirmed["outcome"] == "cancel_confirmed"
+    assert confirmed["finished_at"]
+    assert confirmed["lease_owner"] == ""
+
+    # 终态确定后：迟到的确认、完成与重复申请都无法改写。
+    with pytest.raises(ConflictError):
+        service.confirm_cancel(submitted["id"], "site-storm")
+    with pytest.raises(ConflictError):
+        service.complete(submitted["id"], "site-storm", {"value": 1}, {})
+    replay = service.cancel(submitted["id"], "support-agent-7", "暴雨红色预警，亲子团要求终止行程")
+    assert replay["cancel_outcome"] == "confirmed"
+
+    details = service.get_session(submitted["id"])
+    assert details["outcome"] == "cancel_confirmed"
+    assert [item["action"] for item in details["interventions"]] == ["cancel", "cancel_confirm"]
+    assert details["interventions"][0]["actor"] == "support-agent-7"
+    assert details["interventions"][1]["actor"] == "site-storm"
+
+
+def test_cancel_commitment_expires_with_lease(client):
+    service, clock = make_clocked_service()
+    submitted = service.submit(submit_payload("cancel-expire-001"))
+    claimed = service.claim("site-offline", ["chapter-transfer"], 30)
+    assert claimed and claimed["id"] == submitted["id"]
+    service.cancel(submitted["id"], "support-agent-9", "暴雨预警，亲子团终止行程")
+
+    # 节点离线，租约越过期限：恢复作业沿取消方向终结，而不是回到待分配队列。
+    clock.advance(seconds=31)
+    result = service.recover_expired()
+    assert result["cancelled"] == [submitted["id"]]
+    assert result["recovered"] == [] and result["exhausted"] == []
+
+    details = service.get_session(submitted["id"])
+    assert details["status"] == "cancelled"
+    assert details["cancel_outcome"] == "expired"
+    assert details["outcome"] == "cancel_expired"
+    assert details["cancel_requested_by"] == "support-agent-9"
+    assert details["finished_at"]
+    assert details["interventions"][-1]["action"] == "cancel_timeout"
+    assert service.claim("site-other", ["chapter-transfer"], 60) is None
+
+    # 恢复作业重跑幂等，迟到的节点确认与完成都改不了超时终态。
+    assert service.recover_expired() == {"recovered": [], "exhausted": [], "cancelled": []}
+    with pytest.raises(ConflictError):
+        service.confirm_cancel(submitted["id"], "site-offline")
+    with pytest.raises(ConflictError):
+        service.complete(submitted["id"], "site-offline", {"value": 1}, {})
+    assert service.get_session(submitted["id"])["cancel_outcome"] == "expired"
+
+
+def test_cancel_commitment_survives_process_restart(client):
+    service, clock = make_clocked_service()
+    submitted = service.submit(submit_payload("cancel-restart-001"))
+    service.claim("site-a", ["chapter-transfer"], 60)
+    service.cancel(submitted["id"], "support-agent-3", "道路积水，终止接驳")
+
+    # 模拟进程重启：新的服务实例读取同一数据库，承诺与终态行为保持一致。
+    restarted = PilotOperationsService(get_connection(), clock)
+    view = restarted.get_session(submitted["id"])
+    assert view["status"] == "cancel_requested"
+    assert view["cancel_requested_by"] == "support-agent-3"
+    with pytest.raises(ConflictError):
+        restarted.heartbeat(submitted["id"], "site-a", 60)
+    confirmed = restarted.confirm_cancel(submitted["id"], "site-a")
+    assert confirmed["cancel_outcome"] == "confirmed"
+    assert restarted.get_session(submitted["id"])["outcome"] == "cancel_confirmed"
+
+
+def test_queued_cancel_and_outcome_visibility_via_api(client):
+    create_protocol(client)
+    submitted = client.post("/api/pilots/sessions", json=submit_payload("cancel-queued-001")).json()
+    cancelled = client.post(f"/api/pilots/sessions/{submitted['id']}/cancel", json={"actor": "support-agent-1", "reason": "项目计划变更"})
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["cancel_outcome"] == "immediate"
+    assert cancelled.json()["outcome"] == "cancel_immediate"
+
+    details = client.get(f"/api/pilots/session-details/{submitted['id']}").json()
+    assert details["outcome"] == "cancel_immediate"
+    assert details["cancel_requested_by"] == "support-agent-1"
+    listed = client.get("/api/pilots/sessions", params={"status": "cancelled"}).json()["items"]
+    assert [item["outcome"] for item in listed] == ["cancel_immediate"]
+
+
+def test_cancel_confirmation_api(client):
+    create_protocol(client)
+    submitted = client.post("/api/pilots/sessions", json=submit_payload("cancel-api-001")).json()
+    claimed = client.post("/api/pilots/sessions/claim", json={"site_code": "w1", "capabilities": ["chapter-transfer"], "lease_seconds": 60})
+    assert claimed.json()["session"]["id"] == submitted["id"]
+    client.post(f"/api/pilots/sessions/{submitted['id']}/cancel", json={"actor": "support-agent-2", "reason": "暴雨预警终止行程"})
+
+    missing = client.post(f"/api/pilots/sessions/{submitted['id']}/heartbeat", json={"site_code": "w1", "capabilities": [], "lease_seconds": 60})
+    assert missing.status_code == 409
+    wrong_site = client.post(f"/api/pilots/sessions/{submitted['id']}/cancel-confirmation", json={"site_code": "w2"})
+    assert wrong_site.status_code == 409
+    confirmed = client.post(f"/api/pilots/sessions/{submitted['id']}/cancel-confirmation", json={"site_code": "w1", "note": "游客已安置到县城酒店"})
+    assert confirmed.status_code == 200
+    assert confirmed.json()["status"] == "cancelled"
+    assert confirmed.json()["outcome"] == "cancel_confirmed"
+
+    details = client.get(f"/api/pilots/session-details/{submitted['id']}").json()
+    assert details["interventions"][-1]["action"] == "cancel_confirm"
+    assert details["interventions"][-1]["reason"] == "游客已安置到县城酒店"
 
