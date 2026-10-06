@@ -232,6 +232,10 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     available_at TEXT NOT NULL,
     lease_owner TEXT NOT NULL DEFAULT '',
     lease_expires_at TEXT NOT NULL DEFAULT '',
+    cancel_requested_by TEXT NOT NULL DEFAULT '',
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT NOT NULL DEFAULT '',
+    stop_outcome TEXT NOT NULL DEFAULT '' CHECK(stop_outcome IN ('','confirmed','timeout')),
     current_observation_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
@@ -334,7 +338,8 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _migrate_pilot_sessions(connection)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -356,6 +361,20 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+
+
+def _migrate_pilot_sessions(connection: sqlite3.Connection) -> None:
+    """为既有数据库补齐停止承诺相关列（新库已由 SCHEMA 直接建好）。"""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(pilot_sessions)")}
+    additions = {
+        "cancel_requested_by": "ALTER TABLE pilot_sessions ADD COLUMN cancel_requested_by TEXT NOT NULL DEFAULT ''",
+        "cancel_reason": "ALTER TABLE pilot_sessions ADD COLUMN cancel_reason TEXT NOT NULL DEFAULT ''",
+        "cancel_requested_at": "ALTER TABLE pilot_sessions ADD COLUMN cancel_requested_at TEXT NOT NULL DEFAULT ''",
+        "stop_outcome": "ALTER TABLE pilot_sessions ADD COLUMN stop_outcome TEXT NOT NULL DEFAULT '' CHECK(stop_outcome IN ('','confirmed','timeout'))",
+    }
+    for column, statement in additions.items():
+        if column not in columns:
+            connection.execute(statement)
 
 
 def migrate_db() -> None:
